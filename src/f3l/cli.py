@@ -9,7 +9,7 @@ EXCHANGE_INSTANCES = {
 @click.option("--exchange", type=click.Choice(["kucoin"], case_sensitive=False), default="kucoin", help="Choose exchange")
 @click.pass_context
 def cli(ctx, exchange : AbstractExchange):
-    """CLI tool to interact with crypto exchanges."""
+    """cli tool to interact with crypto exchanges"""
     ctx.obj = EXCHANGE_INSTANCES[exchange]
 
 @cli.command()
@@ -70,7 +70,7 @@ def limit(exchange: AbstractExchange, side: str, symbol: str, price: float, size
 @click.pass_obj
 def limit_batch(exchange: AbstractExchange, side: str, symbol: str, price: float, size: float, leverage: int, orders: int, spread: float):
     """Create a group of limit orders based on a 1:1 ratio on the selected exchange."""
-    result = exchange.limit_batch(side, symbol.upper(), price, size, leverage, orders, spread)
+    result = exchange.limit_1(side, symbol.upper(), price, size, leverage, orders, spread)
     click.echo(result)
 
 @cli.command()
@@ -84,7 +84,7 @@ def limit_batch(exchange: AbstractExchange, side: str, symbol: str, price: float
 @click.pass_obj
 def limit_x3(exchange: AbstractExchange, side: str, symbol: str, price: float, size: float, leverage: int, orders: int, spread: float):
     """Create a batch of limit orders based on a 3:2:1 ratio on the exchange."""
-    order, summary = exchange.limit_x3(side, symbol.upper(), price, size, leverage, orders, spread)
+    order, summary = exchange.limit_3(side, symbol.upper(), price, size, leverage, orders, spread)
     click.echo("Order Details:")
     click.echo(order)
     click.echo("\nSummary:")
