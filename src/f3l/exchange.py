@@ -1,514 +1,363 @@
-import requests
-import time
-import hmac
+"""Exchange clients.
+
+``AbstractExchange`` is the interface the CLI and the order algorithms use.
+``KuCoin`` implements it for KuCoin Futures (USDT-margined and inverse).
+Every method returns plain data; formatting lives in the CLI.
+"""
+
+from __future__ import annotations
+
 import base64
 import hashlib
+import hmac
 import json
 import os
+import time
+from abc import ABC, abstractmethod
+from typing import Any, Iterable, Optional
+from urllib.parse import urlencode
+
+import requests
 from dotenv import load_dotenv
-import tabulate
+
+from .models import D, Contract, OrderRequest, OrderStatus, Ticker, fmt
 
 
-class AbstractExchange:
-    """An Abstract Exchange Class"""
+class ExchangeError(Exception):
+    """The exchange rejected a request or could not be reached."""
 
-    def __init__(self):
-        load_dotenv()
+    def __init__(self, message: str, code: Optional[str] = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
-    # GET
-    def funding(self):
-        """Show active funding on open ordered symbols"""
-        raise NotImplementedError
+    def __str__(self) -> str:
+        return f"[{self.code}] {self.message}" if self.code else self.message
 
-    def orders(self):
-        """Show all open orders"""
-        raise NotImplementedError
 
-    def balance(self):
-        """Get balance of account"""
-        raise NotImplementedError
+class MissingCredentials(ExchangeError):
+    pass
 
-    def price(self):
-        """Get current price"""
-        raise NotImplementedError
 
-    def positions(self):
-        """Get active positions in market"""
-        raise NotImplementedError
+class AbstractExchange(ABC):
+    """What every exchange must provide."""
 
-    # POST
-    def limit(self):
-        """Open a limit order"""
-        raise NotImplementedError
+    name = "abstract"
 
-    def market(self):
-        """Open a market order"""
-        raise NotImplementedError
+    # --- market data (no credentials needed) ---
+    @abstractmethod
+    def contract(self, symbol: str) -> Contract: ...
 
-    def limit_1(self):
-        """Open a batch of limit orders"""
-        raise NotImplementedError
+    @abstractmethod
+    def ticker(self, symbol: str) -> Ticker: ...
 
-    def limit_3(self):
-        """Open a batch of limit orders with x3 3:2:1 ratio sizing"""
-        raise NotImplementedError
+    @abstractmethod
+    def mark_price(self, symbol: str) -> dict: ...
 
-    # Delete
-    def cancel(self):
-        """Cancel Order given <orderid>"""
-        raise NotImplementedError
+    @abstractmethod
+    def klines(self, symbol: str, granularity_min: int, start_ms: int, end_ms: int) -> list[list]: ...
 
-    def cancel_all(self):
-        """Cancel all open orders from <symbol>"""
-        raise NotImplementedError
+    # --- account ---
+    @abstractmethod
+    def balance(self) -> dict: ...
 
-    def nuke_all(self):
-        """Nukes all open orders"""
-        raise NotImplementedError
+    @abstractmethod
+    def open_orders(self, symbol: Optional[str] = None) -> list[dict]: ...
+
+    @abstractmethod
+    def stop_orders(self, symbol: Optional[str] = None) -> list[dict]: ...
+
+    @abstractmethod
+    def positions(self, symbol: Optional[str] = None) -> list[dict]: ...
+
+    @abstractmethod
+    def order(self, order_id: str) -> OrderStatus: ...
+
+    # --- trading ---
+    @abstractmethod
+    def place_order(self, req: OrderRequest) -> str:
+        """Place one order and return its exchange order id."""
+
+    @abstractmethod
+    def place_orders(self, reqs: list[OrderRequest]) -> list[dict]:
+        """Place several orders. Returns one dict per order with
+        ``order_id`` on success or ``error`` on failure, in input order."""
+
+    @abstractmethod
+    def cancel_order(self, order_id: str) -> None: ...
+
+    @abstractmethod
+    def cancel_all(self, symbol: Optional[str] = None) -> list[str]:
+        """Cancel open limit orders (all symbols when symbol is None)."""
+
+    @abstractmethod
+    def cancel_all_stops(self, symbol: Optional[str] = None) -> list[str]:
+        """Cancel untriggered stop orders (all symbols when symbol is None)."""
+
+    def position_qty(self, symbol: str) -> int:
+        """Signed position size in lots (positive long, negative short)."""
+        qty = 0
+        for pos in self.positions(symbol):
+            if pos.get("symbol") == symbol and pos.get("isOpen", True):
+                qty += int(pos.get("currentQty") or 0)
+        return qty
 
 
 class KuCoin(AbstractExchange):
-    """KuCoin Futures Exchange Implementation"""
+    """KuCoin Futures REST client."""
 
-    api: str
-    secret: str
-    url: str
-    passphrase: str
+    name = "kucoin"
+    BASE_URL = "https://api-futures.kucoin.com"
+    BATCH_LIMIT = 20
+    GET_RETRIES = 2
 
-    def __init__(self):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        secret: Optional[str] = None,
+        passphrase: Optional[str] = None,
+        base_url: str = BASE_URL,
+        timeout: float = 10.0,
+        session: Optional[requests.Session] = None,
+    ):
         load_dotenv()
-        self.api = os.getenv("KuCoinAPI")
-        self.secret = os.getenv("KuCoinSecret")
-        self.url = "https://api-futures.kucoin.com"
-        self.passphrase = os.getenv("KuCoinPass")
+        self.api_key = api_key or os.getenv("KuCoinAPI")
+        self.secret = secret or os.getenv("KuCoinSecret")
+        self.passphrase = passphrase or os.getenv("KuCoinPass")
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.session = session or requests.Session()
+        self._contracts: dict[str, Contract] = {}
 
-        if not all([self.api, self.secret, self.passphrase]):
-            raise KeyError
+    # ------------------------------------------------------------------ http
+    def _sign(self, text: str) -> str:
+        digest = hmac.new(self.secret.encode(), text.encode(), hashlib.sha256).digest()
+        return base64.b64encode(digest).decode()
 
-    def _generate_signature(self, timestamp, method, endpoint, body=None):
-        """Generate KuCoin signature for API authentication"""
-        if body is None or body == "":
-            body_str = ""
-        else:
-            body_str = json.dumps(body)
-
-        what = timestamp + method + endpoint + body_str
-        signature = base64.b64encode(
-            hmac.new(
-                self.secret.encode('utf-8'),
-                what.encode('utf-8'),
-                hashlib.sha256
-            ).digest()
-        ).decode('utf-8')
-
-        return signature
-
-    def _get_headers(self, method, endpoint, body=None):
-        """Generate authentication headers for KuCoin API requests"""
+    def _auth_headers(self, method: str, path: str, body: str) -> dict:
+        if not all([self.api_key, self.secret, self.passphrase]):
+            raise MissingCredentials(
+                "KuCoin API credentials missing: set KuCoinAPI, KuCoinSecret and "
+                "KuCoinPass in your environment or a .env file"
+            )
         timestamp = str(int(time.time() * 1000))
-        signature = self._generate_signature(timestamp, method, endpoint, body)
-
-        # KC-API-SIGN-PASSPHRASE needs to be encrypted for v2 API
-        passphrase = base64.b64encode(
-            hmac.new(
-                self.secret.encode('utf-8'),
-                self.passphrase.encode('utf-8'),
-                hashlib.sha256
-            ).digest()
-        ).decode('utf-8')
-
-        headers = {
-            "KC-API-KEY": self.api,
-            "KC-API-SIGN": signature,
+        return {
+            "KC-API-KEY": self.api_key,
+            "KC-API-SIGN": self._sign(timestamp + method + path + body),
             "KC-API-TIMESTAMP": timestamp,
-            "KC-API-PASSPHRASE": passphrase,
+            "KC-API-PASSPHRASE": self._sign(self.passphrase),
             "KC-API-KEY-VERSION": "3",
-            "Content-Type": "application/json"
         }
 
-        return headers
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict] = None,
+        body: Any = None,
+        auth: bool = True,
+    ) -> Any:
+        params = {k: v for k, v in (params or {}).items() if v is not None}
+        if params:
+            path = f"{path}?{urlencode(params)}"
+        body_str = json.dumps(body, separators=(",", ":")) if body is not None else ""
+        # Only reads are retried: retrying a POST/DELETE could duplicate an action.
+        attempts = 1 + (self.GET_RETRIES if method == "GET" else 0)
+        last_error: Optional[Exception] = None
+        for attempt in range(attempts):
+            headers = {"Content-Type": "application/json"}
+            if auth:
+                headers.update(self._auth_headers(method, path, body_str))
+            try:
+                resp = self.session.request(
+                    method,
+                    self.base_url + path,
+                    headers=headers,
+                    data=body_str or None,
+                    timeout=self.timeout,
+                )
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                last_error = exc
+                if attempt + 1 < attempts:
+                    time.sleep(0.5 * (attempt + 1))
+                continue
+            return self._parse(resp)
+        raise ExchangeError(f"network error talking to KuCoin: {last_error}")
 
-    def balance(self) -> tabulate:
-        """
-        Get balance of the account
-        
-        Returns:
-            tabulte table
-        """
-        endpoint = "/api/v1/account-overview?currency=USDT"
-        response = requests.request("GET", f"{self.url}{endpoint}", headers=self._get_headers("GET", endpoint)).json()
-        balance_info = response["data"]
-        formatted = []
-        for key, value in balance_info.items():
-            formatted.append({"Property": key, "Value": value})
+    @staticmethod
+    def _parse(resp: requests.Response) -> Any:
+        try:
+            payload = resp.json()
+        except ValueError:
+            raise ExchangeError(
+                f"HTTP {resp.status_code} from KuCoin: {resp.text[:200]}"
+            ) from None
+        code = str(payload.get("code", ""))
+        if code != "200000":
+            raise ExchangeError(payload.get("msg") or f"HTTP {resp.status_code}", code)
+        return payload.get("data")
 
-        table = tabulate.tabulate(formatted, headers="keys", tablefmt="fancy_grid")
-        return table
+    # ----------------------------------------------------------- market data
+    def contract(self, symbol: str) -> Contract:
+        if symbol not in self._contracts:
+            data = self._request("GET", f"/api/v1/contracts/{symbol}", auth=False)
+            if not data:
+                raise ExchangeError(f"unknown contract {symbol}")
+            self._contracts[symbol] = Contract(
+                symbol=data["symbol"],
+                tick_size=D(data["tickSize"]),
+                lot_size=int(data.get("lotSize") or 1),
+                multiplier=D(data["multiplier"]),
+                is_inverse=bool(data.get("isInverse")),
+                max_leverage=int(data["maxLeverage"]) if data.get("maxLeverage") else None,
+                max_order_lots=int(data["maxOrderQty"]) if data.get("maxOrderQty") else None,
+            )
+        return self._contracts[symbol]
 
-    def orders(self) -> tabulate:
-        """
-        Get all open orders
-        
-        Returns:
-            tabulate table
-        """
-        endpoint = "/api/v1/orders?status=active"
-        headers = self._get_headers("GET", endpoint)
-        response = requests.get(f"{self.url}{endpoint}", headers=headers)
-        response = response.json()['data']['items']
+    def ticker(self, symbol: str) -> Ticker:
+        data = self._request("GET", "/api/v1/ticker", {"symbol": symbol}, auth=False)
+        return Ticker(
+            symbol=symbol,
+            bid=D(data["bestBidPrice"]),
+            ask=D(data["bestAskPrice"]),
+            last=D(data["price"]),
+        )
 
-        formatted = []
-        for item in response:
-            temp = {}
-            temp["id"] = item['id']
-            temp['symbol'] = item['symbol']
-            temp['side'] = item['side']
-            temp['price'] = item['price']
-            temp['size_usd'] = float(item['value'])
-            temp['status'] = item['status']
-            formatted.append(temp)
+    def mark_price(self, symbol: str) -> dict:
+        return self._request("GET", f"/api/v1/mark-price/{symbol}/current", auth=False)
 
-        if len(formatted) > 0:
-            table = tabulate.tabulate(formatted, headers="keys", tablefmt="fancy_grid")
-            return table
-        else:
-            table = tabulate.tabulate([{"Orders": "No Orders Active"}], headers="keys", tablefmt="fancy_grid")
-            return table
+    def klines(self, symbol: str, granularity_min: int, start_ms: int, end_ms: int) -> list[list]:
+        params = {"symbol": symbol, "granularity": granularity_min, "from": start_ms, "to": end_ms}
+        return self._request("GET", "/api/v1/kline/query", params, auth=False) or []
 
-    def price(self, symbol: str) -> tabulate:
-        """
-        Get market price for a symbol
-        
-        Args:
-            symbol (str): Trading pair symbol
-        
-        Returns:
-            tabulate table
-        
-        """
-        endpoint = f"/api/v1/mark-price/{symbol}/current"
-        response = requests.get(f"{self.url}{endpoint}").json()['data']
-        formatted = []
-        for key, value in response.items():
-            formatted.append({"Property": key, "Value": value})
+    # --------------------------------------------------------------- account
+    def balance(self) -> dict:
+        return self._request("GET", "/api/v1/account-overview", {"currency": "USDT"})
 
-        table = tabulate.tabulate(formatted, headers="keys", tablefmt="fancy_grid")
-        return table
+    def _paged_items(self, path: str, params: dict) -> list[dict]:
+        items: list[dict] = []
+        page = 1
+        while True:
+            data = self._request("GET", path, {**params, "currentPage": page, "pageSize": 100})
+            if isinstance(data, list):  # some endpoints return a bare list
+                return data
+            items.extend(data.get("items") or [])
+            if page >= int(data.get("totalPage") or 1):
+                return items
+            page += 1
 
-    def _limit(self, side: str, symbol: str, price: float, size: float, leverage: int) -> json:
-        """
-        Create a new limit order internally
+    def open_orders(self, symbol: Optional[str] = None) -> list[dict]:
+        return self._paged_items("/api/v1/orders", {"status": "active", "symbol": symbol})
 
-        Args:
-            side (str): Order side ("buy" or "sell").
-            symbol (str): Trading pair symbol.
-            price (float): Limit price for the order.
-            size (float): Size of the order in USD.
-            leverage (int): Leverage level for the order.
-        
-        Returns:
-            dict: API response containing order information or failure message.
-        
-        """
-        endpoint = "/api/v1/orders"
-        body = {
-            "clientOid": str(int(time.time() * 1000)),
-            "symbol": str(symbol),
-            "type": "limit",
-            "price": str(price),
-            "valueQty": size,
-            "side": side,
-            "leverage": leverage
+    def stop_orders(self, symbol: Optional[str] = None) -> list[dict]:
+        return self._paged_items("/api/v1/stopOrders", {"symbol": symbol})
+
+    def positions(self, symbol: Optional[str] = None) -> list[dict]:
+        if symbol:
+            data = self._request("GET", "/api/v1/position", {"symbol": symbol})
+            return [data] if data else []
+        return self._request("GET", "/api/v1/positions") or []
+
+    def order(self, order_id: str) -> OrderStatus:
+        data = self._request("GET", f"/api/v1/orders/{order_id}")
+        return OrderStatus(
+            order_id=data.get("id", order_id),
+            lots=int(data.get("size") or 0),
+            filled_lots=int(data.get("filledSize") or data.get("dealSize") or 0),
+            filled_value=D(data.get("filledValue") or data.get("dealValue") or 0),
+            is_active=bool(data.get("isActive")),
+        )
+
+    # --------------------------------------------------------------- trading
+    @staticmethod
+    def order_body(req: OrderRequest) -> dict:
+        """Translate an OrderRequest into KuCoin's JSON body."""
+        req.validate()
+        body: dict[str, Any] = {
+            "clientOid": req.client_oid,
+            "symbol": req.symbol,
+            "type": req.type,
         }
+        if req.side:
+            body["side"] = req.side
+        if req.lots is not None:
+            body["size"] = int(req.lots)
+        if req.leverage is not None:
+            body["leverage"] = int(req.leverage)
+        if req.type == "limit":
+            body["price"] = fmt(req.price)
+        if req.margin_mode:
+            body["marginMode"] = req.margin_mode.upper()
+        if req.time_in_force:
+            body["timeInForce"] = req.time_in_force
+        for attr, key in (
+            ("post_only", "postOnly"),
+            ("hidden", "hidden"),
+            ("iceberg", "iceberg"),
+            ("reduce_only", "reduceOnly"),
+            ("close_order", "closeOrder"),
+        ):
+            if getattr(req, attr):
+                body[key] = True
+        if req.iceberg:
+            body["visibleSize"] = str(req.visible_lots)
+        if req.stop:
+            body["stop"] = req.stop
+            body["stopPrice"] = fmt(req.stop_price)
+            body["stopPriceType"] = req.stop_price_type
+        if req.has_tpsl:
+            body["stopPriceType"] = req.stop_price_type
+            if req.take_profit is not None:
+                body["triggerStopUpPrice" if req.side == "buy" else "triggerStopDownPrice"] = fmt(req.take_profit)
+            if req.stop_loss is not None:
+                body["triggerStopDownPrice" if req.side == "buy" else "triggerStopUpPrice"] = fmt(req.stop_loss)
+        return body
 
-        headers = self._get_headers("POST", endpoint, body)
-        response = requests.post(f"{self.url}{endpoint}", headers=headers, json=body).json()
-        if response['code'] != '200000':
-            return {"Order Failed to open": "Order Failed To Open"}
+    def place_order(self, req: OrderRequest) -> str:
+        body = self.order_body(req)
+        # Orders with attached take-profit / stop-loss use the st-orders endpoint.
+        path = "/api/v1/st-orders" if req.has_tpsl else "/api/v1/orders"
+        data = self._request("POST", path, body=body)
+        return data["orderId"]
+
+    def place_orders(self, reqs: list[OrderRequest]) -> list[dict]:
+        results: list[dict] = []
+        for chunk in _chunks(reqs, self.BATCH_LIMIT):
+            if any(r.has_tpsl for r in chunk):
+                raise ValueError("batch orders cannot carry take-profit/stop-loss")
+            bodies = [self.order_body(r) for r in chunk]
+            try:
+                data = self._request("POST", "/api/v1/orders/multi", body=bodies) or []
+            except ExchangeError as exc:
+                results.extend({"error": str(exc)} for _ in chunk)
+                continue
+            by_oid = {item.get("clientOid"): item for item in data}
+            for req in chunk:
+                item = by_oid.get(req.client_oid, {})
+                if item.get("orderId") and str(item.get("code", "200000")) == "200000":
+                    results.append({"order_id": item["orderId"]})
+                else:
+                    results.append({"error": f"[{item.get('code')}] {item.get('msg') or 'rejected'}"})
+        return results
+
+    def cancel_order(self, order_id: str) -> None:
+        self._request("DELETE", f"/api/v1/orders/{order_id}")
+
+    def cancel_all(self, symbol: Optional[str] = None) -> list[str]:
+        if symbol:
+            data = self._request("DELETE", "/api/v3/orders", {"symbol": symbol})
         else:
-            return response
+            data = self._request("DELETE", "/api/v1/orders")
+        return list((data or {}).get("cancelledOrderIds") or [])
 
-    def limit(self, side: str, symbol: str, price: float, size: float, leverage: int) -> json:
-        """
-        Create a new limit order
-        
-        Args:
-            side (str): Order side ("buy" or "sell").
-            symbol (str): Trading pair symbol.
-            price (float): Limit price for the order.
-            size (float): Size of the order in USD.
-            leverage (int): Leverage level for the order.
-            
-        Returns:
-            tabulate table
-        """
-        endpoint = "/api/v1/orders"
-        body = {
-            "clientOid": str(int(time.time() * 1000)),
-            "symbol": str(symbol),
-            "type": "limit",
-            "price": str(price),
-            "valueQty": size,
-            "side": side,
-            "leverage": leverage
-        }
-
-        headers = self._get_headers("POST", endpoint, body)
-        response = requests.post(f"{self.url}{endpoint}", headers=headers, json=body).json()
-        if response['code'] != '200000':
-            table = tabulate.tabulate([{"Order": "Failed"}], headers="keys", tablefmt="fancy_grid")
-            return table
-        else:
-            formatted = []
-            for key, value in response['data'].items():
-                print(key, value)
-                formatted.append({"Property": key, "Value": value})
-            table = tabulate.tabulate(formatted, headers="keys", tablefmt="fancy_grid")
-            return table
-
-    def limit_1(self, side: str, symbol: str, price: str, size: float, leverage: int, orders: int, spread: float):
-        """
-        Create a batch of evenly distributed limit orders.
-        
-        Args:
-            side (str): Order side ("buy" or "sell").
-            symbol (str): Trading pair symbol.
-            price (str): Starting price for orders.
-            size (float): Total size to distribute across orders in USD.
-            leverage (int): Leverage level for orders.
-            orders (int): Number of orders to create.
-            spread (float): Price difference between consecutive orders.
-            
-        Returns:
-            None: Places orders but doesn't return confirmation.
-        """
-        x = float(size) / int(orders)
-        y = float(price)
-        for _ in range(int(orders)):
-            self._limit(side, symbol, y, x, leverage)
-            y -= float(spread)
-
-    def limit_3(self, side: str, symbol: str, price: float, total_size: float, leverage: int, orders: int, spread: float):
-        """
-        Create a bottom-heavy position size distribution with x3 sizing ratio and variable spread.
-        
-        Places larger orders at lower prices for buy orders, or at higher prices for sell orders.
-        Uses a ratio-based sizing approach where later orders are larger, and dynamically reduces
-        the spread as order sizes increase.
-        
-        Args:
-            side (str): Order side ("buy" or "sell").
-            symbol (str): Trading pair symbol.
-            price (float): Starting price for the first order.
-            total_size (float): Total position size to distribute in USD.
-            leverage (int): Leverage level for orders.
-            orders (int): Number of orders to create (minimum 3).
-            spread (float): Initial spread between orders (decreases for larger positions).
-            
-        Returns:
-            tuple: Two formatted tables:
-                  - Orders table with detailed information on each placed order
-                  - Summary table with overall position statistics
-                  
-        Raises:
-            ValueError: If fewer than 3 orders are requested.
-        """
-        orders = int(orders)
-        price = float(price)
-        total_size = float(total_size)
-        spread = float(spread)
-        successful_orders = 0
-
-        if orders < 3:
-            raise ValueError("limit_x3 requires at least 3 orders")
-
-        # Calculate position sizes with bottom-heavy distribution
-        # Using a ratio based on position number
-        ratio_sum = sum(range(1, orders + 1))
-        unit_size = total_size / ratio_sum
-
-        positions = []
-        current_price = float(price)
-
-        # If buying, we place larger orders at lower prices
-        # If selling, we place larger orders at higher prices
-        price_direction = -1 if side == "buy" else 1
-
-        # Store the initial spread for reference
-        initial_spread = spread
-
-        for i in range(orders):
-            # For buy orders: start with small size at highest price, end with largest at lowest price
-            # For sell orders: start with small size at lowest price, end with largest at highest price
-            if side == "buy":
-                order_number = i + 1
-                # Adjust spread to get tighter as orders get bigger
-                # For buys, this means smaller spreads for later (larger) orders
-                spread_factor = 1 - ((i / orders) * 0.5)  # Gradually reduce spread by up to 50%
-            else:
-                order_number = orders - i
-                # For sells, this means smaller spreads for earlier (larger) orders
-                spread_factor = 1 - (((orders - i - 1) / orders) * 0.5)  # Gradually reduce spread by up to 50%
-
-            # Calculate size for this specific order (proportional to its position)
-            order_size = unit_size * order_number
-
-            # Round size to appropriate precision
-            order_size = round(order_size, 4)
-
-            # Place the order
-            result = self._limit(side, symbol, current_price, order_size, leverage)
-            # Check if order was successful
-            order_successful = True
-            if "Order Failed to open" in result:
-                order_successful = False
-            elif result.get('code') != '200000' and 'code' in result:
-                order_successful = False
-
-            # Only count successful orders
-            if order_successful:
-                successful_orders += 1
-
-            positions.append({
-                "price": current_price,
-                "size": order_size,
-                "spread_used": spread * spread_factor,
-                "result": result,
-                "successful": order_successful
-            })
-
-            # Adjust price for next order with the adjusted spread
-            current_price += price_direction * (spread * spread_factor)
-
-        pos = {
-            "orders": positions,
-            "total_size": total_size,
-            "price_range": f"{price} to {positions[-1]['price']}",
-            "initial_spread": initial_spread,
-            "final_spread": positions[-1]["spread_used"],
-            "orders_open": successful_orders  # Only count successful orders
-        }
-
-        # Format the order data for tabulation
-        formatted_orders = []
-        # Temp for looking at orders.
-        for order in pos["orders"]:
-            status = "Success" if order.get("successful", False) else "Failed"
-            order_id = order["result"].get("data", {}).get("orderId", "N/A") if order["result"] and "data" in order["result"] else "N/A"
-
-            formatted_orders.append({
-                "Price": order["price"],
-                "Size": order["size"],
-                "Spread": order["spread_used"],
-                "Status": status,
-                "Order ID": order_id
-            })
-        # Create a summary table
-
-        summary = [
-            {"Property": "Total Size", "Value": pos["total_size"]},
-            {"Property": "Price Range", "Value": pos["price_range"]},
-            {"Property": "Initial Spread", "Value": pos["initial_spread"]},
-            {"Property": "Final Spread", "Value": pos["final_spread"]},
-            {"Property": "Orders Open", "Value": pos["orders_open"]},
-        ]
-
-        # Generate tables using tabulate
-        orders_table = tabulate.tabulate(formatted_orders, headers="keys", tablefmt="fancy_grid")
-        summary_table = tabulate.tabulate(summary, headers="keys", tablefmt="fancy_grid") 
-        return orders_table, summary_table
-
-    def cancel_all(self, symbol: str):
-        """Cancel all open orders for a specific symbol.
-        
-        Args:
-            symbol (str): Trading pair symbol to cancel orders for.
-            
-        Returns:
-            tabulate: Formatted table showing all cancelled order IDs.
-        """
-        endpoint = f"/api/v3/orders?symbol={symbol}"
-        headers = self._get_headers("DELETE", endpoint)
-        response = requests.delete(f'{self.url}{endpoint}', headers=headers).json()['data']
-        formatted = []
-        cancellation_data = response['cancelledOrderIds']
-        i = 0
-        for value in cancellation_data:
-            formatted.append({"Property": i, "Order Id": value})
-            i += 1
-
-        table = tabulate.tabulate(formatted, headers="keys", tablefmt="fancy_grid")
-        return table
-
-    def positions(self, symbol):
-        """
-        Returns all active positions for a specific symbol or all symbols.
-        
-        Args:
-            symbol (str): Trading pair symbol to get positions for. 
-                          If empty string, returns positions for all symbols.
-
-        Returns:
-            dict: API response containing position information.
-        """
-        if symbol != "":
-            endpoint = f"/api/v1/positions?symbol={symbol}"
-        else:
-            endpoint = "/api/v1/positions"
-        headers = self._get_headers("GET", endpoint)
-        response = requests.get(f"{self.url}{endpoint}", headers=headers)
-        response = response.json()['data']
-        return response
+    def cancel_all_stops(self, symbol: Optional[str] = None) -> list[str]:
+        data = self._request("DELETE", "/api/v1/stopOrders", {"symbol": symbol})
+        return list((data or {}).get("cancelledOrderIds") or [])
 
 
-class ByBit(AbstractExchange):
-    """Bybit Futures Exchange Implementation"""
-
-    def __init__(self):
-        load_dotenv()
-        
-        self.api = os.getenv("ByBitAPI")
-        self.secret = os.getenv("ByBitSecret")
-        self.url = "https://api.bybit.com"
-
-        if not all([self.api, self.secret]):
-            print(f"Warning: Missing ByBit credentials - API: {bool(self.api)}, Secret: {bool(self.secret)}")
-
-    def price(self, symbol):
-        pass
-
-    def orders(self):
-        pass
-
-    def open_order(self, price, symbol, type_order):
-        pass
+def _chunks(items: list, size: int) -> Iterable[list]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
 
 
-class Binance(AbstractExchange):
-    """Binance Futures Exchange Implementation"""
-    
-    def __init__(self):
-        load_dotenv()
-        
-        self.api = os.getenv("BinanceAPI")
-        self.secret = os.getenv("BinanceSecret")
-        self.url = "https://api.binance.com"
-        
-        # Validate credentials
-        if not all([self.api, self.secret]):
-            print(f"Warning: Missing Binance credentials - API: {bool(self.api)}, Secret: {bool(self.secret)}")
-    
-    def price(self, symbol):
-        pass
-    
-    def orders(self):
-        pass
-    
-    def open_order(self, price, symbol, type_order):
-        pass
-
-
-if __name__ == "__main__":
-    import python_ta
-
-    python_ta.check_all()
+EXCHANGES = {"kucoin": KuCoin}
